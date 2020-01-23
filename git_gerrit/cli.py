@@ -244,6 +244,33 @@ Configuration variables:
         print_error(e)
         return 1
 
+def git_gerrit_pickchain(argv=None):
+    """ Show oneline log with gerrit numbers. """
+    config = git_gerrit.Config()
+    template = config.get('logformat', default='{number} {hash} {subject}')
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        prog='git-gerrit-log',
+        description=git_gerrit_log.__doc__.strip())
+
+
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument('-g', '--gerrit', action='store_false', default=True,
+                        dest='gerrit', help='start search with gerrit number(s)')
+    group.add_argument('-s', '--sha1', dest='sha1', action='store_true', default=False,
+                        help='start search with sha1(s)')
+    parser.add_argument('-b', '--branchfilter', dest='branchfilter', help='regex filter for branches')
+
+    parser.add_argument('searchlist', nargs='+', help='list of gerrit or sha1s')
+
+    args = vars(parser.parse_args(argv))
+    try:
+        for l in git_gerrit.pickchain(**args):
+            print(l)
+    except GitGerritError as e:
+        print_error(e)
+        return 1
+
 def git_gerrit_query(argv=None):
     """ Search gerrit. """
     config = git_gerrit.Config()

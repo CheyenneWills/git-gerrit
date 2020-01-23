@@ -215,7 +215,7 @@ def current_change(number, repodir=None):
     returns:
         a current change dictionary (including the current patchset number)
     """
-    changes = list(query('change:{0}'.format(number), limit=1, current_revision=True, repodir=repodir))
+    changes = list(query('change:{0}'.format(number), limit=1, current_revision=True, repodir=repodir, details=True))
     if not changes or len(changes) != 1:
         raise GitGerritNotFoundError('gerrit {0} not found'.format(number))
     change = changes[0]
@@ -495,3 +495,164 @@ def unpicked(upstream_branch='HEAD', downstream_branch=None, repodir=None):
     for commit in log(revision=upstream_branch, shorthash=False):
         if commit['hash'] in x:
             yield commit
+
+def pickchain(searchlist, gerrit=True, sha1=False, branchfilter=None, repodir=None):
+    """
+    For a given commit, find where the commit came from and where it went
+    """
+
+    class _pick():
+        # A little container
+        def __init__(self, sha1, gerrit=None, repodir=None):
+            if gerrit:
+                self.gerritnum = gerrit
+            else:
+                self.gerritnum = ''
+            self.sha1 = None
+            self.up = None          # Did we come from somewhere
+            self.down = []          # Commits down
+            git = sh.Command('git').bake(_cwd=repodir, _tty_out=False)
+            args = [sha1]
+            options = {}
+            options['pretty'] = 'hash:%H%nsubject:%s%n%n%b%%%%'
+            options['max-count'] = 1
+            options['_iter'] = True
+
+            for line in git.log(*args, **options):
+                line = cook(line)
+                line = line.strip()
+                m = re.match(r'^hash:(.*)', line)
+                if m:
+                    self.sha1 = m.group(1)
+                    continue
+                m = re.match(r'^Reviewed-on: .*/([0-9]+)$', line)
+                if m:
+                    self.gerritnum = m.group(1) # get last one
+                    continue
+
+
+
+        def getdown(self):
+
+            git = sh.Command('git').bake(_cwd=repodir, _tty_out=False)
+
+            args = []
+            options = {}
+            options['grep'] = r'^\s*\(cherry picked from commit {0}\)\s*$'.format(self.sha1)
+            options['E'] = True
+            options['all'] = True
+            options['pretty'] = 'hash:%H%nsubject:%s%n%n%b%%%%'
+            options['_iter'] = True
+            curhash = None
+            curpick = None
+            for line in git.log(*args, **options):
+                line = cook(line)
+                line = line.strip()
+                m = re.match(r'^hash:(.*)', line)
+                if m:
+                    curhash = m.group(1)
+                    continue
+                m = re.match(r'^\(cherry picked from commit (.*)\)$', line)
+                if m:
+                    curpick = m.group(1)
+                    continue # Need the last one
+                m = re.match(r'^%%$', line)
+                if m:       # End of the commit message
+                    if curpick == self.sha1:
+                        self.down.append(_pick(curhash))
+                    curhash = None
+                    curpick = None
+                    continue
+
+            for _ in self.down:
+                _.getdown()
+
+        def getup(self):
+
+            git = sh.Command('git').bake(_cwd=repodir, _tty_out=False)
+
+            args = [self.sha1]
+
+            options = {}
+            options['pretty'] = 'hash:%H%nsubject:%s%n%n%b%%%%'
+            options['max-count'] = 1
+            options['_iter'] = True
+
+            for line in git.log(*args, **options):
+                line = cook(line)
+                line = line.strip()
+
+                m = re.match(r'^\(cherry picked from commit (.*)\)$', line)
+                if m:
+                    self.up = m.group(1)
+                    continue
+
+            return self.up
+
+        def showchain(self, indent=-1):
+            if indent < 0:
+                i = 0
+            else:
+                i = indent
+            yield (i, self)
+            if indent >= 0:
+                indent = indent + 1
+            for _ in self.down:
+                for c in _.showchain(indent):
+                    yield c
+
+    if type(searchlist) != list:
+        searchlist = [searchlist]
+
+    for item in searchlist:
+        gnum = None
+        if sha1:
+            sitem = item
+        else:
+            gnum = item
+            c = current_change(item)
+            if c['status'] == 'ABANDONED':
+                yield item.ljust(7) + ': ABANDONED'
+                continue
+            elif c['status'] == 'MERGED':
+                for _ in c['details']['messages']:
+                    m = re.match(r'^Change has been successfully cherry-picked as ([a-zA-Z0-9]*)', _['message'])
+                    if m:
+                        sitem = m.group(1)
+                        continue    # Need the last one
+            else:
+                yield item.ljust(7) + ': Not yet merged'
+                continue
+
+        cur_commit = _pick(sitem,gerrit=gnum)
+
+        # Find the root commit
+        _ = cur_commit.getup()
+        while _:
+            cur_commit = _pick(_)
+            _ = cur_commit.getup()
+
+        head_commit = cur_commit
+
+        head_commit.getdown()
+
+        for _ in head_commit.showchain(indent=0):
+
+            git = sh.Command('git').bake(_cwd=repodir, _tty_out=False)
+
+            args = []
+            options = {}
+            options['contains'] = _[1].sha1
+            options['r'] = True
+            options['_iter'] = True
+            branchl = []
+            for line in git.branch(*args, **options):
+                line = cook(line)
+                line = line.strip()
+                if branchfilter and re.match(branchfilter, line):
+                    branchl.append(line[7:])
+            if branchfilter and len(branchl) == 0:
+                continue
+            s = _[1].gerritnum.ljust(7) + ":" + ''.ljust(_[0]) + _[1].sha1 + "\t" + ', '.join(branchl)
+            yield s
+
