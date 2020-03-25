@@ -260,6 +260,7 @@ def git_gerrit_pickchain(argv=None):
     group.add_argument('-s', '--sha1', dest='sha1', action='store_true', default=False,
                         help='start search with sha1(s)')
     parser.add_argument('-b', '--branchfilter', dest='branchfilter', help='regex filter for branches')
+    parser.add_argument('-r', '--remotefilter', dest='remotefilter', help='regex filter for remotes')
 
     parser.add_argument('searchlist', nargs='+', help='list of gerrit or sha1s')
 

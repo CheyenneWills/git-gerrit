@@ -504,102 +504,157 @@ def pickchain(searchlist, gerrit=True, sha1=False, branchfilter=None, repodir=No
     class _pick():
         # A little container
         def __init__(self, sha1, gerrit=None, repodir=None):
-            if gerrit:
-                self.gerritnum = gerrit
-            else:
-                self.gerritnum = ''
+
             self.sha1 = None
-            self.up = None          # Did we come from somewhere
-            self.down = []          # Commits down
-            git = sh.Command('git').bake(_cwd=repodir, _tty_out=False)
-            args = [sha1]
-            options = {}
-            options['pretty'] = 'hash:%H%nsubject:%s%n%n%b%%%%'
-            options['max-count'] = 1
-            options['_iter'] = True
+            self.merge_hash = None
+            self.change = None
+            if gerrit:
+                self.gerritnum = str(gerrit)
+            else:
+                self.gerritnum = None
 
-            for line in git.log(*args, **options):
-                line = cook(line)
-                line = line.strip()
-                m = re.match(r'^hash:(.*)', line)
-                if m:
-                    self.sha1 = m.group(1)
-                    continue
-                m = re.match(r'^Reviewed-on: .*/([0-9]+)$', line)
-                if m:
-                    self.gerritnum = m.group(1) # get last one
-                    continue
+            self.picked_from = set()    # Who picked from
+            self.picked_to = set()      # Descendants
+
+            self.gerrits = []           # referenced gerrits
 
 
+            if sha1:
+                q_str = 'commit:{0}'.format(sha1)
+            elif gerrit:
+                q_str = 'change:{0}'.format(gerrit)
+            else:
+                raise GitGerritNotFoundError('missing parameter')
+            q = list(query(q_str,details=True))
 
-        def getdown(self):
+            if q:
+                if len(q) > 1:
+                    if sha1:
+                        raise GitGerritNotFoundError('gerrit {0} not found'.format(sha1))
+                    else:
+                        raise GitGerritNotFoundError('gerrit {0} not found'.format(gerrit))
 
+
+                change = q[0]
+                self.sha1 = change['hash']
+                self.gerritnum = str(change['number'])
+
+                # not in gerrit..
+                git = sh.Command('git').bake(_cwd=repodir, _tty_out=False)
+                args = [self.sha1]
+                options = {}
+                options['pretty'] = 'hash:%H%nsubject:%s%n%n%b%%%%'
+                options['max-count'] = 1
+                options['_iter'] = True
+
+                for line in git.log(*args, **options):
+                    line = cook(line)
+                    line = line.strip()
+
+                    m = re.match(r'^Reviewed-on: .*/([0-9]+)$', line)
+                    if m:
+                        self.gerrits.append(str(m.group(1)))
+                        continue
+                    m = re.match(r'^\(cherry picked from commit (.*)\)$', line)
+                    if m:
+                        # Need the last one
+                        self.picked_from.add(m.group(1))
+            else:
+                # not in gerrit..
+                git = sh.Command('git').bake(_cwd=repodir, _tty_out=False)
+                args = [sha1]
+                options = {}
+                options['pretty'] = 'hash:%H%nsubject:%s%n%n%b%%%%'
+                options['max-count'] = 1
+                options['_iter'] = True
+
+                for line in git.log(*args, **options):
+                    line = cook(line)
+                    line = line.strip()
+                    m = re.match(r'^hash:(.*)', line)
+                    if m:
+                        self.sha1 = m.group(1)
+                        continue
+                    m = re.match(r'^Reviewed-on: .*/([0-9]+)$', line)
+                    if m:
+                        self.gerrits.append(str(m.group(1)))
+                        self.gerritnum = str(m.group(1)) # get last one
+                        continue
+                    print("<%s>" % line)
+                    m = re.match(r'^\(cherry picked from commit (.*)\)$', line)
+                    if m:
+                        # Need the last one
+                        self.picked_from.add(m.group(1))
+
+            if len(self.picked_from) == 0 and len(self.gerrits) > 1:
+                # did not see a cherry picked from commit comment.. so use the reviewed-on history..
+                picked_gerrit = self.gerrits[-2]    # Use
+
+            if self.gerritnum:
+                self.gerrits.discard(self.gerritnum)
+                self.change = current_change(self.gerritnum)
+                if self.change['status'] == 'MERGED':
+                    for _ in self.change['details']['messages']:
+                        m = re.match(r'^Change has been successfully cherry-picked as ([a-zA-Z0-9]*)', _['message'])
+                        if m:
+                            self.merge_hash = m.group(1)
+                            continue    # Need the last one
+
+        def getsha1ids(self):
+            sha1 = set()
+            if self.sha1: sha1.add(self.sha1)
+            if self.merge_hash: sha1.add(self.merge_hash)
+            if self.change:
+                sha1.add(self.change['hash'])
+            return {_:self for _ in sha1}
+
+        def getgerritids(self):
+            gerrit = set()
+            if self.gerritnum: gerrit.add(self.gerritnum)
+            if self.change:
+                gerrit.add(str(self.change['number']))
+            return {_:self for _ in gerrit}
+
+        def findrefs(self):
+            # Search for any commits that contain a reference back to this commit
+            # generates sha1
             git = sh.Command('git').bake(_cwd=repodir, _tty_out=False)
 
             args = []
             options = {}
-            options['grep'] = r'^\s*\(cherry picked from commit {0}\)\s*$'.format(self.sha1)
+            g = r'(^\s*\(cherry picked from commit {0}\)\s*$)'.format(self.sha1)
+            if self.merge_hash:
+                g += r'(^\s*\(cherry picked from commit {0}\)\s*$)'.format(self.merge_hash)
+            if self.gerritnum:
+                g += r'|(^\s*Reviewed-on: .*/{0}\s*$)'.format(self.gerritnum)
+
+            options['grep'] = g
+
             options['E'] = True
             options['all'] = True
-            options['pretty'] = 'hash:%H%nsubject:%s%n%n%b%%%%'
+            options['pretty'] = 'hash:%H'
             options['_iter'] = True
-            curhash = None
-            curpick = None
+
             for line in git.log(*args, **options):
                 line = cook(line)
                 line = line.strip()
                 m = re.match(r'^hash:(.*)', line)
                 if m:
-                    curhash = m.group(1)
-                    continue
-                m = re.match(r'^\(cherry picked from commit (.*)\)$', line)
-                if m:
-                    curpick = m.group(1)
-                    continue # Need the last one
-                m = re.match(r'^%%$', line)
-                if m:       # End of the commit message
-                    if curpick == self.sha1:
-                        self.down.append(_pick(curhash))
-                    curhash = None
-                    curpick = None
-                    continue
+                    yield m.group(1)
 
-            for _ in self.down:
-                _.getdown()
+            for _ in self.gerrits:
+                current = current_change(_)
+                yield current['hash']
 
-        def getup(self):
+        def show(self):
+            # Return a list of use and our children
 
-            git = sh.Command('git').bake(_cwd=repodir, _tty_out=False)
+            return [{'hash':self.sha1,
+                   'gerrit':self.gerritnum,
+                   'up':[_ for _ in self.picked_from],
+                   "down": [_.show for _ in self.picked_to]
+                }]
 
-            args = [self.sha1]
-
-            options = {}
-            options['pretty'] = 'hash:%H%nsubject:%s%n%n%b%%%%'
-            options['max-count'] = 1
-            options['_iter'] = True
-
-            for line in git.log(*args, **options):
-                line = cook(line)
-                line = line.strip()
-
-                m = re.match(r'^\(cherry picked from commit (.*)\)$', line)
-                if m:
-                    self.up = m.group(1)
-                    continue
-
-            return self.up
-
-        def showchain(self, indent=-1):
-            if indent < 0:
-                i = 0
-            else:
-                i = indent
-            yield (i, self)
-            if indent >= 0:
-                indent = indent + 1
-            for _ in self.down:
-                for c in _.showchain(indent):
-                    yield c
 
     if type(searchlist) != list:
         searchlist = [searchlist]
@@ -626,33 +681,66 @@ def pickchain(searchlist, gerrit=True, sha1=False, branchfilter=None, repodir=No
 
         cur_commit = _pick(sitem,gerrit=gnum)
 
-        # Find the root commit
-        _ = cur_commit.getup()
-        while _:
-            cur_commit = _pick(_)
-            _ = cur_commit.getup()
+        commit_by_sha1 = cur_commit.getsha1ids()
+        commit_by_gerrit = cur_commit.getgerritids()
 
-        head_commit = cur_commit
+        commit_list = [cur_commit]
+        search_list = [cur_commit]
+        seen = set()
 
-        head_commit.getdown()
+        while len(search_list) > 0:
+            cur_commit = search_list[0]
+            search_list.remove(cur_commit)
+            if cur_commit not in seen:
+                seen.add(cur_commit)
+                for refs in cur_commit.findrefs():
+                    if refs not in commit_by_sha1:
+                        new_commit = _pick(refs)
 
-        for _ in head_commit.showchain(indent=0):
+                        search_list.append(new_commit)
+                        commit_list.append(new_commit)
+
+                        commit_by_sha1.update(new_commit.getsha1ids())
+                        commit_by_gerrit.update(new_commit.getgerritids())
+
+
+        for cur_commit in commit_list:
+            for _ in cur_commit.picked_from:
+                parent = commit_by_sha1[_]
+                parent.picked_to.add(cur_commit)
+        for cur_commit in commit_list:
+            for _ in cur_commit.picked_to:
+                child = commit_by_sha1[_]
+                child.picked_from.add(cur_commit)
+
+        head_commit = None
+        for cur_commit in commit_list:
+            if len(cur_commit.picked_from) == 0:
+                if head_commit is not None:
+                    print("oops.. two heads are not better then one")
+                head_commit = cur_commit
+
+        print(head_commit.show())
+
+        for _ in commit_list:
 
             git = sh.Command('git').bake(_cwd=repodir, _tty_out=False)
 
             args = []
             options = {}
-            options['contains'] = _[1].sha1
-            options['r'] = True
+            options['contains'] = _.sha1
             options['_iter'] = True
+            options['r'] = True
             branchl = []
             for line in git.branch(*args, **options):
                 line = cook(line)
                 line = line.strip()
-                if branchfilter and re.match(branchfilter, line):
-                    branchl.append(line[7:])
+                if line[0] == '*':
+                    line = line[2:]
+                if (branchfilter and re.match(branchfilter, line)) or not branchfilter:
+                    branchl.append(line)
             if branchfilter and len(branchl) == 0:
                 continue
-            s = _[1].gerritnum.ljust(7) + ":" + ''.ljust(_[0]) + _[1].sha1 + "\t" + ', '.join(branchl)
+            s = _.gerritnum.ljust(7) + ":" + _.sha1 + "\t" + ', '.join(branchl)
             yield s
 
